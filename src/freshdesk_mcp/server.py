@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 from mcp.server.fastmcp import FastMCP
 import logging
@@ -10,12 +11,39 @@ from pydantic import BaseModel, Field
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("freshdesk_mcp")
 
 # Initialize FastMCP server
 mcp = FastMCP("freshdesk-mcp")
 
-FRESHDESK_API_KEY = os.getenv("FRESHDESK_API_KEY")
-FRESHDESK_DOMAIN = os.getenv("FRESHDESK_DOMAIN")
+FRESHDESK_API_KEY = (os.getenv("FRESHDESK_API_KEY") or "").strip()
+FRESHDESK_DOMAIN = (os.getenv("FRESHDESK_DOMAIN") or "").strip().rstrip("/")
+
+if not FRESHDESK_API_KEY:
+    raise ValueError("FRESHDESK_API_KEY environment variable is required")
+if not FRESHDESK_DOMAIN:
+    raise ValueError("FRESHDESK_DOMAIN environment variable is required")
+
+AUTH_HEADER = f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+
+DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+MAX_RETRIES = 3
+DEFAULT_RETRY_AFTER = 2
+
+
+async def _request_with_retry(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+    """Make an HTTP request with automatic retry on 429 (rate limit) responses."""
+    http_fn = getattr(client, method)
+    for attempt in range(MAX_RETRIES + 1):
+        response = await http_fn(url, **kwargs)
+        if response.status_code == 429 and attempt < MAX_RETRIES:
+            retry_after = int(response.headers.get("Retry-After", DEFAULT_RETRY_AFTER))
+            logger.warning("Rate limited (429). Retry in %ds (%d/%d)", retry_after, attempt + 1, MAX_RETRIES)
+            await asyncio.sleep(retry_after)
+            continue
+        return response
+    return response
 
 
 def parse_link_header(link_header: str) -> Dict[str, Optional[int]]:
@@ -71,6 +99,7 @@ class TicketPriority(IntEnum):
     MEDIUM = 2
     HIGH = 3
     URGENT = 4
+
 class AgentTicketScope(IntEnum):
     GLOBAL_ACCESS = 1
     GROUP_ACCESS = 2
@@ -166,11 +195,24 @@ async def get_ticket_fields() -> Dict[str, Any]:
     """Get ticket fields from Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/ticket_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return {"fields": response.json()}
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
 @mcp.tool()
@@ -191,13 +233,13 @@ async def get_tickets(page: Optional[int] = 1, per_page: Optional[int] = 30) -> 
     }
 
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers, params=params)
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
             response.raise_for_status()
 
             # Parse pagination from Link header
@@ -231,7 +273,7 @@ async def create_ticket(
     email: Optional[str] = None,
     requester_id: Optional[int] = None,
     custom_fields: Optional[Dict[str, Any]] = None,
-    additional_fields: Optional[Dict[str, Any]] = None  # 👈 new parameter
+    additional_fields: Optional[Dict[str, Any]] = None
 ) -> str:
     """Create a ticket in Freshdesk"""
     # Validate requester information
@@ -277,30 +319,27 @@ async def create_ticket(
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.post(url, headers=headers, json=data)
+            response = await _request_with_retry(client, "post", url, headers=headers, json=data)
             response.raise_for_status()
-
-            if response.status_code == 201:
-                return "Ticket created successfully"
-
-            response_data = response.json()
-            return f"Success: {response_data}"
+            return response.json()
 
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:
-                # Handle validation errors and check for mandatory custom fields
-                error_data = e.response.json()
-                if "errors" in error_data:
-                    return f"Validation Error: {error_data['errors']}"
-            return f"Error: Failed to create ticket - {str(e)}"
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"Failed to create ticket: {str(e)}", "details": error_detail}
         except Exception as e:
-            return f"Error: An unexpected error occurred - {str(e)}"
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def update_ticket(ticket_id: int, ticket_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -310,7 +349,7 @@ async def update_ticket(ticket_id: int, ticket_fields: Dict[str, Any]) -> Dict[s
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
@@ -328,9 +367,9 @@ async def update_ticket(ticket_id: int, ticket_fields: Dict[str, Any]) -> Dict[s
     if custom_fields:
         update_data['custom_fields'] = custom_fields
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.put(url, headers=headers, json=update_data)
+            response = await _request_with_retry(client, "put", url, headers=headers, json=update_data)
             response.raise_for_status()
 
             return {
@@ -358,99 +397,187 @@ async def update_ticket(ticket_id: int, ticket_fields: Dict[str, Any]) -> Dict[s
             }
 
 @mcp.tool()
-async def delete_ticket(ticket_id: int) -> str:
+async def delete_ticket(ticket_id: int) -> Dict[str, Any]:
     """Delete a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.delete(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "delete", url, headers=headers)
+            if response.status_code == 204:
+                return {"success": True, "message": "Ticket deleted successfully"}
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"Failed to delete ticket: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def get_ticket(ticket_id: int):
+async def get_ticket(ticket_id: int) -> Dict[str, Any]:
     """Get a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def search_tickets(query: str) -> Dict[str, Any]:
     """Search for tickets in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/tickets"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     params = {"query": query}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, params=params)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def get_ticket_conversation(ticket_id: int)-> list[Dict[str, Any]]:
+async def get_ticket_conversation(ticket_id: int) -> Dict[str, Any]:
     """Get a ticket conversation in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/conversations"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def create_ticket_reply(ticket_id: int,body: str)-> Dict[str, Any]:
+async def create_ticket_reply(ticket_id: int, body: str) -> Dict[str, Any]:
     """Create a reply to a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/reply"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {
         "body": body
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def create_ticket_note(ticket_id: int,body: str)-> Dict[str, Any]:
+async def create_ticket_note(ticket_id: int, body: str) -> Dict[str, Any]:
     """Create a note for a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/notes"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {
         "body": body
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def update_ticket_conversation(conversation_id: int,body: str)-> Dict[str, Any]:
+async def update_ticket_conversation(conversation_id: int, body: str) -> Dict[str, Any]:
     """Update a conversation for a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/conversations/{conversation_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {
         "body": body
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=data)
-        status_code = response.status_code
-        if status_code == 200:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=data)
+            response.raise_for_status()
             return response.json()
-        else:
-            return f"Cannot update conversation ${response.json()}"
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"Failed to update conversation: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def get_agents(page: Optional[int] = 1, per_page: Optional[int] = 30)-> list[Dict[str, Any]]:
+async def get_agents(page: Optional[int] = 1, per_page: Optional[int] = 30) -> list[Dict[str, Any]]:
     """Get all agents in Freshdesk with pagination support."""
     # Validate input parameters
     if page < 1:
@@ -460,104 +587,207 @@ async def get_agents(page: Optional[int] = 1, per_page: Optional[int] = 30)-> li
         return {"error": "Page size must be between 1 and 100"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/agents"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     params = {
         "page": page,
         "per_page": per_page
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, params=params)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_contacts(page: Optional[int] = 1, per_page: Optional[int] = 30)-> list[Dict[str, Any]]:
+async def list_contacts(page: Optional[int] = 1, per_page: Optional[int] = 30) -> list[Dict[str, Any]]:
     """List all contacts in Freshdesk with pagination support."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     params = {
         "page": page,
         "per_page": per_page
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, params=params)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def get_contact(contact_id: int)-> Dict[str, Any]:
+async def get_contact(contact_id: int) -> Dict[str, Any]:
     """Get a contact in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts/{contact_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def search_contacts(query: str)-> list[Dict[str, Any]]:
+async def search_contacts(query: str) -> list[Dict[str, Any]]:
     """Search for contacts in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts/autocomplete"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     params = {"term": query}
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, params=params)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def update_contact(contact_id: int, contact_fields: Dict[str, Any])-> Dict[str, Any]:
+async def update_contact(contact_id: int, contact_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a contact in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts/{contact_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {}
     for field, value in contact_fields.items():
         data[field] = value
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def list_canned_responses(folder_id: int)-> list[Dict[str, Any]]:
+async def list_canned_responses(folder_id: int) -> list[Dict[str, Any]]:
     """List all canned responses in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_response_folders/{folder_id}/responses"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    canned_responses = []
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        for canned_response in response.json():
-            canned_responses.append(canned_response)
-    return canned_responses
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_canned_response_folders()-> list[Dict[str, Any]]:
+async def list_canned_response_folders() -> list[Dict[str, Any]]:
     """List all canned response folders in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_response_folders"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def view_canned_response(canned_response_id: int)-> Dict[str, Any]:
+async def view_canned_response(canned_response_id: int) -> Dict[str, Any]:
     """View a canned response in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_responses/{canned_response_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def create_canned_response(canned_response_fields: Dict[str, Any])-> Dict[str, Any]:
+async def create_canned_response(canned_response_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Create a canned response in Freshdesk."""
     # Validate input using Pydantic model
     try:
@@ -569,209 +799,430 @@ async def create_canned_response(canned_response_fields: Dict[str, Any])-> Dict[
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_responses"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=canned_response_data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=canned_response_data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def update_canned_response(canned_response_id: int, canned_response_fields: Dict[str, Any])-> Dict[str, Any]:
+async def update_canned_response(canned_response_id: int, canned_response_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a canned response in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_responses/{canned_response_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=canned_response_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=canned_response_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def create_canned_response_folder(name: str)-> Dict[str, Any]:
+async def create_canned_response_folder(name: str) -> Dict[str, Any]:
     """Create a canned response folder in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_response_folders"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {
         "name": name
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def update_canned_response_folder(folder_id: int, name: str)-> Dict[str, Any]:
+async def update_canned_response_folder(folder_id: int, name: str) -> Dict[str, Any]:
     """Update a canned response folder in Freshdesk."""
-    print(folder_id, name)
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/canned_response_folders/{folder_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     data = {
         "name": name
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_solution_articles(folder_id: int)-> list[Dict[str, Any]]:
+async def list_solution_articles(folder_id: int) -> list[Dict[str, Any]]:
     """List all solution articles in Freshdesk."""
-    solution_articles = []
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/folders/{folder_id}/articles"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        for article in response.json():
-            solution_articles.append(article)
-    return solution_articles
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_solution_folders(category_id: int)-> list[Dict[str, Any]]:
+async def list_solution_folders(category_id: int) -> list[Dict[str, Any]]:
     if not category_id:
         return {"error": "Category ID is required"}
     """List all solution folders in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories/{category_id}/folders"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_solution_categories()-> list[Dict[str, Any]]:
+async def list_solution_categories() -> list[Dict[str, Any]]:
     """List all solution categories in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def view_solution_category(category_id: int)-> Dict[str, Any]:
+async def view_solution_category(category_id: int) -> Dict[str, Any]:
     """View a solution category in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories/{category_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def create_solution_category(category_fields: Dict[str, Any])-> Dict[str, Any]:
+async def create_solution_category(category_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Create a solution category in Freshdesk."""
     if not category_fields.get("name"):
         return {"error": "Name is required"}
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=category_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=category_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def update_solution_category(category_id: int, category_fields: Dict[str, Any])-> Dict[str, Any]:
+async def update_solution_category(category_id: int, category_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a solution category in Freshdesk."""
     if not category_fields.get("name"):
         return {"error": "Name is required"}
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories/{category_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=category_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=category_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def create_solution_category_folder(category_id: int, folder_fields: Dict[str, Any])-> Dict[str, Any]:
+async def create_solution_category_folder(category_id: int, folder_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Create a solution category folder in Freshdesk."""
     if not folder_fields.get("name"):
         return {"error": "Name is required"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/categories/{category_id}/folders"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=folder_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=folder_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def view_solution_category_folder(folder_id: int)-> Dict[str, Any]:
+async def view_solution_category_folder(folder_id: int) -> Dict[str, Any]:
     """View a solution category folder in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/folders/{folder_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def update_solution_category_folder(folder_id: int, folder_fields: Dict[str, Any])-> Dict[str, Any]:
+async def update_solution_category_folder(folder_id: int, folder_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a solution category folder in Freshdesk."""
     if not folder_fields.get("name"):
         return {"error": "Name is required"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/folders/{folder_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=folder_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=folder_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 
 @mcp.tool()
-async def create_solution_article(folder_id: int, article_fields: Dict[str, Any])-> Dict[str, Any]:
+async def create_solution_article(folder_id: int, article_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Create a solution article in Freshdesk."""
     if not article_fields.get("title") or not article_fields.get("status") or not article_fields.get("description"):
         return {"error": "Title, status and description are required"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/folders/{folder_id}/articles"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=article_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=article_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def view_solution_article(article_id: int)-> Dict[str, Any]:
+async def view_solution_article(article_id: int) -> Dict[str, Any]:
     """View a solution article in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/articles/{article_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def update_solution_article(article_id: int, article_fields: Dict[str, Any])-> Dict[str, Any]:
+async def update_solution_article(article_id: int, article_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a solution article in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/solutions/articles/{article_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=article_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=article_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def view_agent(agent_id: int)-> Dict[str, Any]:
+async def view_agent(agent_id: int) -> Dict[str, Any]:
     """View an agent in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/agents/{agent_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def create_agent(agent_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -788,12 +1239,12 @@ async def create_agent(agent_fields: Dict[str, Any]) -> Dict[str, Any]:
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/agents"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.post(url, headers=headers, json=agent_fields)
+            response = await _request_with_retry(client, "post", url, headers=headers, json=agent_fields)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -807,36 +1258,76 @@ async def update_agent(agent_id: int, agent_fields: Dict[str, Any]) -> Dict[str,
     """Update an agent in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/agents/{agent_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=agent_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=agent_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def search_agents(query: str) -> list[Dict[str, Any]]:
     """Search for agents in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/agents/autocomplete?term={query}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
-async def list_groups(page: Optional[int] = 1, per_page: Optional[int] = 30)-> list[Dict[str, Any]]:
+async def list_groups(page: Optional[int] = 1, per_page: Optional[int] = 30) -> list[Dict[str, Any]]:
     """List all groups in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/groups"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
     params = {
         "page": page,
         "per_page": per_page
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers, params=params)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def create_group(group_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -851,13 +1342,13 @@ async def create_group(group_fields: Dict[str, Any]) -> Dict[str, Any]:
 
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/groups"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.post(url, headers=headers, json=group_data)
+            response = await _request_with_retry(client, "post", url, headers=headers, json=group_data)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -871,89 +1362,169 @@ async def view_group(group_id: int) -> Dict[str, Any]:
     """View a group in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/groups/{group_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def create_ticket_field(ticket_field_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Create a ticket field in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/admin/ticket_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=ticket_field_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=ticket_field_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
 async def view_ticket_field(ticket_field_id: int) -> Dict[str, Any]:
     """View a ticket field in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/admin/ticket_fields/{ticket_field_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def update_ticket_field(ticket_field_id: int, ticket_field_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a ticket field in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/admin/ticket_fields/{ticket_field_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=ticket_field_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=ticket_field_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def update_group(group_id: int, group_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a group in Freshdesk."""
-    try:
-        validated_fields = GroupCreate(**group_fields)
-        # Convert to dict for API request
-        group_data = validated_fields.model_dump(exclude_none=True)
-    except Exception as e:
-        return {"error": f"Validation error: {str(e)}"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/groups/{group_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
     }
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.put(url, headers=headers, json=group_data)
+            response = await _request_with_retry(client, "put", url, headers=headers, json=group_fields)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            return {
-                "error": f"Failed to update group: {str(e)}",
-                "details": e.response.json() if e.response else None
-            }
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"Failed to update group: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def list_contact_fields()-> list[Dict[str, Any]]:
+async def list_contact_fields() -> list[Dict[str, Any]]:
     """List all contact fields in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contact_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def view_contact_field(contact_field_id: int) -> Dict[str, Any]:
     """View a contact field in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contact_fields/{contact_field_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def create_contact_field(contact_field_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -967,43 +1538,82 @@ async def create_contact_field(contact_field_fields: Dict[str, Any]) -> Dict[str
         return {"error": f"Validation error: {str(e)}"}
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contact_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, headers=headers, json=contact_field_data)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=contact_field_data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
 async def update_contact_field(contact_field_id: int, contact_field_fields: Dict[str, Any]) -> Dict[str, Any]:
     """Update a contact field in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contact_fields/{contact_field_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    async with httpx.AsyncClient() as client:
-        response = await client.put(url, headers=headers, json=contact_field_fields)
-        return response.json()
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=contact_field_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 @mcp.tool()
 async def get_field_properties(field_name: str):
     """Get properties of a specific field by name."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/ticket_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}"
+        "Authorization": AUTH_HEADER
     }
-    actual_field_name=field_name
+    actual_field_name = field_name
     if field_name == "type":
-        actual_field_name="ticket_type"
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()  # Raise error for bad status codes
-        fields = response.json()
+        actual_field_name = "ticket_type"
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers)
+            response.raise_for_status()
+            fields = response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
     # Filter the field by name
     matched_field = next((field for field in fields if field["name"] == actual_field_name), None)
 
     return matched_field
 
 @mcp.prompt()
-def create_ticket(
+def create_ticket_prompt(
     subject: str,
     description: str,
     source: str,
@@ -1035,12 +1645,12 @@ Make sure to reference the correct keys from `get_field_properties()` when const
 
 @mcp.prompt()
 def create_reply(
-    ticket_id:int,
+    ticket_id: int,
     reply_message: str,
 ) -> str:
     """Create a reply in Freshdesk"""
     payload = {
-        "body":reply_message,
+        "body": reply_message,
     }
     return f"""
 Kindly create a ticket reply in Freshdesk for ticket ID {ticket_id} using the following payload:
@@ -1071,13 +1681,13 @@ async def list_companies(page: Optional[int] = 1, per_page: Optional[int] = 30) 
     }
 
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers, params=params)
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
             response.raise_for_status()
 
             # Parse pagination from Link header
@@ -1106,13 +1716,13 @@ async def view_company(company_id: int) -> Dict[str, Any]:
     """Get a company in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/companies/{company_id}"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers)
+            response = await _request_with_retry(client, "get", url, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -1125,15 +1735,15 @@ async def search_companies(query: str) -> Dict[str, Any]:
     """Search for companies in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/companies/autocomplete"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
     # Use the name parameter as specified in the API
     params = {"name": query}
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers, params=params)
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -1146,14 +1756,14 @@ async def find_company_by_name(name: str) -> Dict[str, Any]:
     """Find a company by name in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/companies/autocomplete"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
     params = {"name": name}
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers, params=params)
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -1166,13 +1776,13 @@ async def list_company_fields() -> List[Dict[str, Any]]:
     """List all company fields in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/company_fields"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers)
+            response = await _request_with_retry(client, "get", url, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -1185,16 +1795,18 @@ async def view_ticket_summary(ticket_id: int) -> Dict[str, Any]:
     """Get the summary of a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/summary"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.get(url, headers=headers)
+            response = await _request_with_retry(client, "get", url, headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {"message": "No summary has been created for this ticket"}
             return {"error": f"Failed to fetch ticket summary: {str(e)}"}
         except Exception as e:
             return {"error": f"An unexpected error occurred: {str(e)}"}
@@ -1204,16 +1816,16 @@ async def update_ticket_summary(ticket_id: int, body: str) -> Dict[str, Any]:
     """Update the summary of a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/summary"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
     data = {
         "body": body
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.put(url, headers=headers, json=data)
+            response = await _request_with_retry(client, "put", url, headers=headers, json=data)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -1226,13 +1838,13 @@ async def delete_ticket_summary(ticket_id: int) -> Dict[str, Any]:
     """Delete the summary of a ticket in Freshdesk."""
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets/{ticket_id}/summary"
     headers = {
-        "Authorization": f"Basic {base64.b64encode(f'{FRESHDESK_API_KEY}:X'.encode()).decode()}",
+        "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await client.delete(url, headers=headers)
+            response = await _request_with_retry(client, "delete", url, headers=headers)
             if response.status_code == 204:
                 return {"success": True, "message": "Ticket summary deleted successfully"}
 
