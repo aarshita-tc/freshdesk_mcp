@@ -150,24 +150,35 @@ The server offers several tools for Freshdesk operations:
 
 ## Getting Started
 
-### Installing via Smithery
-
-To install freshdesk_mcp for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@effytech/freshdesk_mcp):
-
-```bash
-npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude
-```
-
 ### Prerequisites
 
 - A Freshdesk account (sign up at [freshdesk.com](https://freshdesk.com))
-- Freshdesk API key
+- Freshdesk API key (generate from Freshdesk admin panel under **Profile Settings > API Key**)
 - `uvx` installed (`pip install uv` or `brew install uv`)
 
-### Configuration
+### Installing via Smithery
 
-1. Generate your Freshdesk API key from the Freshdesk admin panel
-2. Set up your domain and authentication details
+To install freshdesk_mcp automatically via [Smithery](https://smithery.ai/server/@effytech/freshdesk_mcp):
+
+```bash
+# For Claude Code
+npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude-code
+
+# For Claude Desktop
+npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude
+```
+
+### Usage with Claude Code
+
+The repository includes a `.mcp.json` file that Claude Code automatically detects. Set your environment variables before starting Claude Code:
+
+```bash
+export FRESHDESK_API_KEY=<YOUR_FRESHDESK_API_KEY>
+export FRESHDESK_DOMAIN=<YOUR_FRESHDESK_DOMAIN>
+claude
+```
+
+Then type `/mcp` to confirm the server is connected and tools are available.
 
 ### Usage with Claude Desktop
 
@@ -188,6 +199,8 @@ npx -y @smithery/cli install @effytech/freshdesk_mcp --client claude
   }
 }
 ```
+
+3. Restart Claude Desktop to pick up the new configuration.
 
 **Important Notes**:
 - Replace `YOUR_FRESHDESK_API_KEY` with your actual Freshdesk API key
