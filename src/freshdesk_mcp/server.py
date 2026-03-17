@@ -190,6 +190,26 @@ class CannedResponseCreate(BaseModel):
         description="Groups for which the canned response is visible. Required if visibility=2"
     )
 
+class ContactCreate(BaseModel):
+    name: str = Field(..., description="Name of the contact")
+    email: Optional[str] = Field(None, description="Email address of the contact")
+    phone: Optional[str] = Field(None, description="Phone number of the contact")
+    mobile: Optional[str] = Field(None, description="Mobile number of the contact")
+    company_id: Optional[int] = Field(None, description="ID of the company associated with this contact")
+    description: Optional[str] = Field(None, description="Description of the contact")
+    job_title: Optional[str] = Field(None, description="Job title of the contact")
+    tags: Optional[List[str]] = Field(None, description="Tags associated with the contact")
+    custom_fields: Optional[Dict[str, Any]] = Field(None, description="Custom fields as key-value pairs")
+
+class CompanyCreate(BaseModel):
+    name: str = Field(..., description="Name of the company")
+    domains: Optional[List[str]] = Field(None, description="List of domain names for the company")
+    description: Optional[str] = Field(None, description="Description of the company")
+    note: Optional[str] = Field(None, description="Note about the company")
+    industry: Optional[str] = Field(None, description="Industry of the company")
+    renewal_date: Optional[str] = Field(None, description="Renewal date of the company (ISO 8601)")
+    custom_fields: Optional[Dict[str, Any]] = Field(None, description="Custom fields as key-value pairs")
+
 @mcp.tool()
 async def get_ticket_fields() -> Dict[str, Any]:
     """Get ticket fields from Freshdesk."""
@@ -1019,6 +1039,50 @@ async def update_contact(contact_id: int, contact_fields: Dict[str, Any]) -> Dic
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
             response = await _request_with_retry(client, "put", url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def create_contact(contact_fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a new contact in Freshdesk.
+
+    Args:
+        contact_fields: Dictionary with contact data:
+            - name (required): Name of the contact
+            - email (optional): Email address
+            - phone (optional): Phone number
+            - mobile (optional): Mobile number
+            - company_id (optional): Company ID to associate
+            - description (optional): Description
+            - job_title (optional): Job title
+            - tags (optional): List of tags
+            - custom_fields (optional): Custom field values as dict
+    """
+    try:
+        validated_fields = ContactCreate(**contact_fields)
+        contact_data = validated_fields.model_dump(exclude_none=True)
+    except Exception as e:
+        return {"error": f"Validation error: {str(e)}"}
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts"
+    headers = {
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=contact_data)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -2047,6 +2111,85 @@ async def view_company(company_id: int) -> Dict[str, Any]:
         except httpx.HTTPStatusError as e:
             return {"error": f"Failed to fetch company: {str(e)}"}
         except Exception as e:
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def create_company(company_fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a new company in Freshdesk.
+
+    Args:
+        company_fields: Dictionary with company data:
+            - name (required): Name of the company
+            - domains (optional): List of domain names (critical for domain registrar workflows)
+            - description (optional): Company description
+            - note (optional): Internal note about the company
+            - industry (optional): Industry classification
+            - renewal_date (optional): Renewal date (ISO 8601, e.g. "2026-12-31")
+            - custom_fields (optional): Custom field values as dict
+    """
+    try:
+        validated_fields = CompanyCreate(**company_fields)
+        company_data = validated_fields.model_dump(exclude_none=True)
+    except Exception as e:
+        return {"error": f"Validation error: {str(e)}"}
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/companies"
+    headers = {
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "post", url, headers=headers, json=company_data)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
+@mcp.tool()
+async def update_company(company_id: int, company_fields: Dict[str, Any]) -> Dict[str, Any]:
+    """Update a company in Freshdesk.
+
+    Args:
+        company_id: ID of the company to update.
+        company_fields: Dictionary with fields to update:
+            - name (optional): Company name
+            - domains (optional): List of domain names
+            - description (optional): Description
+            - note (optional): Internal note
+            - industry (optional): Industry
+            - renewal_date (optional): Renewal date (ISO 8601)
+            - custom_fields (optional): Custom field values
+    """
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/companies/{company_id}"
+    headers = {
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
+    }
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "put", url, headers=headers, json=company_fields)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
             return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
