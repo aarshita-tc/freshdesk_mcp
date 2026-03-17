@@ -216,8 +216,38 @@ async def get_ticket_fields() -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def get_tickets(page: Optional[int] = 1, per_page: Optional[int] = 30) -> Dict[str, Any]:
-    """Get tickets from Freshdesk with pagination support."""
+async def get_tickets(
+    page: Optional[int] = 1,
+    per_page: Optional[int] = 10,
+    filter: Optional[str] = None,
+    requester_id: Optional[int] = None,
+    email: Optional[str] = None,
+    name: Optional[str] = None,
+    company_id: Optional[int] = None,
+    updated_since: Optional[str] = None,
+    order_by: Optional[str] = None,
+    order_type: Optional[str] = None,
+    include: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get tickets from Freshdesk with filtering, sorting, and pagination.
+
+    Use this tool when filtering by requester name (e.g. "tickets from John Smith") — pass name="John Smith".
+    It will automatically resolve the name to a contact ID and then fetch their tickets.
+
+    Args:
+        page: Page number (default 1).
+        per_page: Results per page, 1-100 (default 30).
+        filter: Predefined filter — one of "new_and_my_open", "watching", "spam", "deleted".
+        requester_id: Filter by requester (contact) ID.
+        email: Filter by requester email address.
+        name: Filter by requester name — e.g. "John Smith". Automatically looks up the contact
+              by name and returns their tickets. Use this for queries like "show tickets from [person]".
+        company_id: Filter by company ID.
+        updated_since: Return tickets updated after this datetime (ISO 8601, e.g. "2026-03-17T00:00:00Z").
+        order_by: Sort field — one of "created_at", "due_by", "updated_at", "status" (default "created_at").
+        order_type: Sort direction — "asc" or "desc" (default "desc").
+        include: Extra data to embed — comma-separated: "stats", "requester", "description", "company".
+    """
     # Validate input parameters
     if page < 1:
         return {"error": "Page number must be greater than 0"}
@@ -225,17 +255,49 @@ async def get_tickets(page: Optional[int] = 1, per_page: Optional[int] = 30) -> 
     if per_page < 1 or per_page > 100:
         return {"error": "Page size must be between 1 and 100"}
 
-    url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets"
-
-    params = {
-        "page": page,
-        "per_page": per_page
-    }
-
     headers = {
         "Authorization": AUTH_HEADER,
         "Content-Type": "application/json"
     }
+
+    # If name is provided, resolve it to a requester_id via contacts autocomplete
+    if name and not requester_id:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                ac_url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts/autocomplete"
+                ac_response = await _request_with_retry(client, "get", ac_url, headers=headers, params={"term": name})
+                ac_response.raise_for_status()
+                contacts = ac_response.json()
+                if contacts:
+                    requester_id = contacts[0].get("id")
+                else:
+                    return {"error": f"No contact found matching name '{name}'", "tickets": [], "pagination": {}}
+        except Exception as e:
+            return {"error": f"Failed to resolve name '{name}' to a contact: {str(e)}"}
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/tickets"
+
+    params: Dict[str, Any] = {
+        "page": page,
+        "per_page": per_page
+    }
+
+    if filter:
+        params["filter"] = filter
+    if requester_id:
+        params["requester_id"] = requester_id
+    if email:
+        params["email"] = email
+    if company_id:
+        params["company_id"] = company_id
+    if updated_since:
+        params["updated_since"] = updated_since
+    if order_by:
+        params["order_by"] = order_by
+    if order_type:
+        params["order_type"] = order_type
+    if include:
+        params["include"] = include
 
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
@@ -248,14 +310,27 @@ async def get_tickets(page: Optional[int] = 1, per_page: Optional[int] = 30) -> 
 
             tickets = response.json()
 
+            # Return compact ticket summaries to avoid exceeding token limits
+            SUMMARY_FIELDS = [
+                "id", "subject", "status", "priority", "type",
+                "requester_id", "responder_id", "group_id", "company_id",
+                "email_config_id", "source", "tags", "due_by",
+                "created_at", "updated_at",
+            ]
+            compact_tickets = [
+                {k: t[k] for k in SUMMARY_FIELDS if k in t}
+                for t in tickets
+            ]
+
             return {
-                "tickets": tickets,
+                "tickets": compact_tickets,
                 "pagination": {
                     "current_page": page,
                     "next_page": pagination_info.get("next"),
                     "prev_page": pagination_info.get("prev"),
                     "per_page": per_page
-                }
+                },
+                "note": "Use get_ticket(ticket_id) for full ticket details including description."
             }
 
         except httpx.HTTPStatusError as e:
@@ -448,11 +523,26 @@ async def get_ticket(ticket_id: int) -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_tickets(query: str) -> Dict[str, Any]:
-    """Search for tickets in Freshdesk."""
+    """Search for tickets in Freshdesk using raw Freshdesk query syntax.
+
+    IMPORTANT: Do NOT use this tool to search by requester name — Freshdesk does not support
+    name-based ticket search. Use get_tickets(name="...") for name lookups instead.
+
+    Valid Freshdesk query syntax examples:
+        "priority:3 AND status:2"
+        "requester_email:'xyz@gmail.com'"
+        "created_at:>'2026-03-01' AND status:4"
+
+    The tool auto-wraps the query in double quotes if needed.
+    Prefer filter_tickets for common structured searches.
+    """
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/tickets"
     headers = {
         "Authorization": AUTH_HEADER
     }
+    # Freshdesk search API requires the query value wrapped in double quotes
+    if not query.startswith('"'):
+        query = f'"{query}"'
     params = {"query": query}
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
@@ -470,6 +560,164 @@ async def search_tickets(query: str) -> Dict[str, Any]:
         except Exception as e:
             logger.error("Unexpected error for %s: %s", url, e)
             return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+def _build_search_query(fields: Dict[str, Any]) -> str:
+    """Build a Freshdesk search query string from structured parameters.
+
+    Supports exact match fields (e.g. priority:3), string fields (e.g. requester_email:'x@y.com'),
+    and date range fields (e.g. created_at:>'2026-03-17').
+
+    Returns a double-quoted query string ready for the Freshdesk search API.
+    """
+    clauses = []
+
+    # Exact numeric/enum fields
+    exact_fields = {
+        "priority": "priority",
+        "status": "status",
+        "agent_id": "agent_id",
+        "group_id": "group_id",
+        "requester_id": "requester_id",
+        "company_id": "company_id",
+    }
+    for param, fd_field in exact_fields.items():
+        if fields.get(param) is not None:
+            clauses.append(f"{fd_field}:{fields[param]}")
+
+    # String fields (wrapped in single quotes)
+    string_fields = {
+        "requester_email": "requester_email",
+        "type": "type",
+        "tag": "tag",
+    }
+    for param, fd_field in string_fields.items():
+        if fields.get(param):
+            clauses.append(f"{fd_field}:'{fields[param]}'")
+
+    # Date range fields
+    date_ranges = {
+        "created_after": ("created_at", ">"),
+        "created_before": ("created_at", "<"),
+        "updated_after": ("updated_at", ">"),
+        "updated_before": ("updated_at", "<"),
+        "due_by_before": ("due_by", "<"),
+    }
+    for param, (fd_field, op) in date_ranges.items():
+        if fields.get(param):
+            clauses.append(f"{fd_field}:{op}'{fields[param]}'")
+
+    query_str = " AND ".join(clauses)
+    return f'"{query_str}"'
+
+
+@mcp.tool()
+async def filter_tickets(
+    requester_email: Optional[str] = None,
+    priority: Optional[int] = None,
+    status: Optional[int] = None,
+    agent_id: Optional[int] = None,
+    group_id: Optional[int] = None,
+    requester_id: Optional[int] = None,
+    company_id: Optional[int] = None,
+    type: Optional[str] = None,
+    tag: Optional[str] = None,
+    created_after: Optional[str] = None,
+    created_before: Optional[str] = None,
+    updated_after: Optional[str] = None,
+    updated_before: Optional[str] = None,
+    due_by_before: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Search tickets using structured filters — no need to write raw query syntax.
+
+    IMPORTANT: This tool does NOT support filtering by requester name.
+    - To find tickets by a person's name (e.g. "tickets from John Smith"), use get_tickets(name="John Smith") instead.
+    - To find tickets by email, use requester_email here or get_tickets(email="...").
+
+    Args:
+        requester_email: Filter by requester email (e.g. "xyz@gmail.com").
+        priority: Filter by priority (1=Low, 2=Medium, 3=High, 4=Urgent).
+        status: Filter by status (2=Open, 3=Pending, 4=Resolved, 5=Closed).
+        agent_id: Filter by assigned agent ID.
+        group_id: Filter by assigned group ID.
+        requester_id: Filter by requester contact ID (numeric ID, not name).
+        company_id: Filter by company ID.
+        type: Filter by ticket type value.
+        tag: Filter by tag.
+        created_after: Tickets created after this date (ISO 8601, e.g. "2026-03-17").
+        created_before: Tickets created before this date (ISO 8601).
+        updated_after: Tickets updated after this date (ISO 8601).
+        updated_before: Tickets updated before this date (ISO 8601).
+        due_by_before: Tickets due before this date (ISO 8601).
+
+    At least one filter parameter must be provided.
+    """
+    fields = {
+        "requester_email": requester_email,
+        "priority": priority,
+        "status": status,
+        "agent_id": agent_id,
+        "group_id": group_id,
+        "requester_id": requester_id,
+        "company_id": company_id,
+        "type": type,
+        "tag": tag,
+        "created_after": created_after,
+        "created_before": created_before,
+        "updated_after": updated_after,
+        "updated_before": updated_before,
+        "due_by_before": due_by_before,
+    }
+
+    # Check at least one filter is provided
+    if not any(v is not None for v in fields.values()):
+        return {"error": "At least one filter parameter must be provided"}
+
+    query = _build_search_query(fields)
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/tickets"
+    headers = {
+        "Authorization": AUTH_HEADER
+    }
+    params = {"query": query}
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            # Freshdesk Search API doesn't support sorting, so sort client-side
+            # by created_at descending (newest first) to match Freshdesk UI order
+            if "results" in data and isinstance(data["results"], list):
+                data["results"] = sorted(
+                    data["results"],
+                    key=lambda t: t.get("created_at", ""),
+                    reverse=True,
+                )
+                # Return compact summaries to avoid exceeding token limits
+                SUMMARY_FIELDS = [
+                    "id", "subject", "status", "priority", "type",
+                    "requester_id", "responder_id", "group_id", "company_id",
+                    "source", "tags", "due_by", "created_at", "updated_at",
+                ]
+                data["results"] = [
+                    {k: t[k] for k in SUMMARY_FIELDS if k in t}
+                    for t in data["results"]
+                ]
+                data["note"] = "Use get_ticket(ticket_id) for full ticket details including description."
+            return data
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 
 @mcp.tool()
 async def get_ticket_conversation(ticket_id: int) -> Dict[str, Any]:
@@ -664,7 +912,13 @@ async def get_contact(contact_id: int) -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_contacts(query: str) -> list[Dict[str, Any]]:
-    """Search for contacts in Freshdesk."""
+    """Search for contacts by name in Freshdesk using fuzzy/partial matching.
+
+    This is the best tool for finding a contact by name — it uses autocomplete
+    and will match partial names (e.g. "Petr" finds "Petr Halik").
+    Use this when looking up a person by name. Use filter_contacts for exact
+    field matching (email, phone, company_id).
+    """
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/contacts/autocomplete"
     headers = {
         "Authorization": AUTH_HEADER
@@ -686,6 +940,71 @@ async def search_contacts(query: str) -> list[Dict[str, Any]]:
         except Exception as e:
             logger.error("Unexpected error for %s: %s", url, e)
             return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def filter_contacts(
+    email: Optional[str] = None,
+    name: Optional[str] = None,
+    phone: Optional[str] = None,
+    company_id: Optional[int] = None,
+    updated_since: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Search contacts using exact field filters via the Freshdesk search API.
+
+    IMPORTANT: For looking up a contact by name, prefer search_contacts instead —
+    it uses fuzzy/partial matching. This tool requires exact name matches.
+    Use this tool when filtering by email, phone, company_id, or date.
+
+    Args:
+        email: Filter by exact email address.
+        name: Filter by exact contact name (use search_contacts for partial/fuzzy name matching).
+        phone: Filter by phone number.
+        company_id: Filter by company ID.
+        updated_since: Contacts updated after this date (ISO 8601, e.g. "2026-03-17").
+
+    At least one filter parameter must be provided.
+    """
+    clauses = []
+    if email:
+        clauses.append(f"email:'{email}'")
+    if name:
+        clauses.append(f"name:'{name}'")
+    if phone:
+        clauses.append(f"phone:'{phone}'")
+    if company_id is not None:
+        clauses.append(f"company_id:{company_id}")
+    if updated_since:
+        clauses.append(f"updated_at:>'{updated_since}'")
+
+    if not clauses:
+        return {"error": "At least one filter parameter must be provided"}
+
+    query = f'"{" AND ".join(clauses)}"'
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/contacts"
+    headers = {
+        "Authorization": AUTH_HEADER
+    }
+    params = {"query": query}
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error("HTTP %s for %s", e.response.status_code, url)
+            error_detail = None
+            try:
+                error_detail = e.response.json()
+            except Exception:
+                pass
+            return {"error": f"API request failed: {str(e)}", "details": error_detail}
+        except Exception as e:
+            logger.error("Unexpected error for %s: %s", url, e)
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 
 @mcp.tool()
 async def update_contact(contact_id: int, contact_fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -1770,6 +2089,55 @@ async def find_company_by_name(name: str) -> Dict[str, Any]:
             return {"error": f"Failed to find company: {str(e)}"}
         except Exception as e:
             return {"error": f"An unexpected error occurred: {str(e)}"}
+
+
+@mcp.tool()
+async def filter_companies(
+    name: Optional[str] = None,
+    domain: Optional[str] = None,
+    custom_field: Optional[str] = None,
+    custom_value: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Search companies using structured filters via the Freshdesk search API.
+
+    Args:
+        name: Filter by company name.
+        domain: Filter by domain name (e.g. "tucows.com") — useful for registrar lookups.
+        custom_field: Custom field name to filter by (use with custom_value).
+        custom_value: Value for the custom field filter.
+
+    At least one filter parameter must be provided.
+    """
+    clauses = []
+    if name:
+        clauses.append(f"name:'{name}'")
+    if domain:
+        clauses.append(f"domain:'{domain}'")
+    if custom_field and custom_value:
+        clauses.append(f"cf_{custom_field}:'{custom_value}'")
+
+    if not clauses:
+        return {"error": "At least one filter parameter must be provided"}
+
+    query = f'"{" AND ".join(clauses)}"'
+
+    url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/companies"
+    headers = {
+        "Authorization": AUTH_HEADER,
+        "Content-Type": "application/json"
+    }
+    params = {"query": query}
+
+    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        try:
+            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            return {"error": f"Failed to search companies: {str(e)}"}
+        except Exception as e:
+            return {"error": f"An unexpected error occurred: {str(e)}"}
+
 
 @mcp.tool()
 async def list_company_fields() -> List[Dict[str, Any]]:
