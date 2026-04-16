@@ -555,6 +555,8 @@ async def search_tickets(query: str) -> Dict[str, Any]:
 
     The tool auto-wraps the query in double quotes if needed.
     Prefer filter_tickets for common structured searches.
+
+    Automatically paginates through all result pages (Freshdesk returns max 30 per page).
     """
     url = f"https://{FRESHDESK_DOMAIN}/api/v2/search/tickets"
     headers = {
@@ -563,12 +565,33 @@ async def search_tickets(query: str) -> Dict[str, Any]:
     # Freshdesk search API requires the query value wrapped in double quotes
     if not query.startswith('"'):
         query = f'"{query}"'
-    params = {"query": query}
+
+    all_results = []
+    page = 1
+    # Freshdesk search API allows up to 10 pages (300 results max)
+    max_pages = 10
+
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
-            response.raise_for_status()
-            return response.json()
+            while page <= max_pages:
+                params = {"query": query, "page": page}
+                response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                results = data.get("results", [])
+                if not results:
+                    break
+                all_results.extend(results)
+                total = data.get("total", 0)
+                # Stop if we've collected all results
+                if len(all_results) >= total:
+                    break
+                page += 1
+
+            return {
+                "total": len(all_results),
+                "results": all_results,
+            }
         except httpx.HTTPStatusError as e:
             logger.error("HTTP %s for %s", e.response.status_code, url)
             error_detail = None
@@ -699,33 +722,50 @@ async def filter_tickets(
     headers = {
         "Authorization": AUTH_HEADER
     }
-    params = {"query": query}
+
+    all_results = []
+    page = 1
+    # Freshdesk search API allows up to 10 pages (300 results max)
+    max_pages = 10
 
     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
         try:
-            response = await _request_with_retry(client, "get", url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            # Freshdesk Search API doesn't support sorting, so sort client-side
-            # by created_at descending (newest first) to match Freshdesk UI order
-            if "results" in data and isinstance(data["results"], list):
-                data["results"] = sorted(
-                    data["results"],
-                    key=lambda t: t.get("created_at", ""),
-                    reverse=True,
-                )
-                # Return compact summaries to avoid exceeding token limits
-                SUMMARY_FIELDS = [
-                    "id", "subject", "status", "priority", "type",
-                    "requester_id", "responder_id", "group_id", "company_id",
-                    "source", "tags", "due_by", "created_at", "updated_at",
-                ]
-                data["results"] = [
-                    {k: t[k] for k in SUMMARY_FIELDS if k in t}
-                    for t in data["results"]
-                ]
-                data["note"] = "Use get_ticket(ticket_id) for full ticket details including description."
-            return data
+            while page <= max_pages:
+                params = {"query": query, "page": page}
+                response = await _request_with_retry(client, "get", url, headers=headers, params=params)
+                response.raise_for_status()
+                data = response.json()
+                results = data.get("results", [])
+                if not results:
+                    break
+                all_results.extend(results)
+                total = data.get("total", 0)
+                # Stop if we've collected all results
+                if len(all_results) >= total:
+                    break
+                page += 1
+
+            # Sort client-side by created_at descending (newest first)
+            all_results = sorted(
+                all_results,
+                key=lambda t: t.get("created_at", ""),
+                reverse=True,
+            )
+            # Return compact summaries to avoid exceeding token limits
+            SUMMARY_FIELDS = [
+                "id", "subject", "status", "priority", "type",
+                "requester_id", "responder_id", "group_id", "company_id",
+                "source", "tags", "due_by", "created_at", "updated_at",
+            ]
+            all_results = [
+                {k: t[k] for k in SUMMARY_FIELDS if k in t}
+                for t in all_results
+            ]
+            return {
+                "total": len(all_results),
+                "results": all_results,
+                "note": "Use get_ticket(ticket_id) for full ticket details including description.",
+            }
         except httpx.HTTPStatusError as e:
             logger.error("HTTP %s for %s", e.response.status_code, url)
             error_detail = None
